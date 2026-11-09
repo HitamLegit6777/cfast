@@ -1,0 +1,16 @@
+[Unit]
+Description=cfast turnstile pure-protocol solver API
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/cfast/solver_api.py
+Environment=TS_BIN=/opt/cfast/challenge
+Environment=TS_PROFILE=/opt/cfast/profile_fast.json
+Environment=TS_PORT=8810
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target
