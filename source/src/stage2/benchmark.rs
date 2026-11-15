@@ -7,11 +7,16 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use oxc::ast::ast::{
+    CallExpression, Expression, MemberExpression, StringLiteral, VariableDeclarator,
+};
+use oxc::ast_visit::{Visit, walk};
+use oxc::str::Ident;
 use serde::{Deserialize, Serialize};
-use swc_core::ecma::ast::{CallExpr, Callee, MemberExpr, MemberProp, VarDeclarator};
-use swc_core::ecma::visit::{Visit, VisitWith};
 
-use crate::js::{self, JsObject, ast, json};
+use super::syntax::{is_optional_call, member};
+use crate::js::ast::{self, Binding, ParsedScript, Script};
+use crate::js::{self, JsObject, json};
 use crate::performance_clock::{PerformanceClock, Resolution};
 use crate::stage2::analysis::recognize::ProbeView;
 use crate::stage2::worker_timing::Samples;
@@ -163,20 +168,27 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
             });
         }
     }
-    // Programs that decode strings in place also hold the source as a descriptor.
-    let parsed = strings
+    // Programs that decode strings in place also hold the source as a descriptor. Some builds
+    // hide the worker's own strings behind a decoder in its source, which deobfuscation inlines.
+    let sources: Vec<String> = strings
+        .iter()
+        .filter(|text| text.contains("WebAssembly"))
+        .filter_map(|source| crate::deobfuscate(source.clone()).ok())
+        .map(|deobfuscated| deobfuscated.text)
+        .collect();
+    let parsed = sources
         .iter()
         .filter(|text| text.contains("WebAssembly.instantiate"))
-        .find_map(|source| ast::parse_javascript("benchmark worker", source).ok())?;
-    let mut worker = Worker::default();
-    parsed.script.visit_with(&mut worker);
+        .find_map(|source| ParsedScript::parse("benchmark worker", source).ok())?;
+    let mut worker = Worker::new(parsed.script());
+    worker.visit_program(parsed.script().program);
     // Only the kernels the recorded speeds measure are supported. Field names are recovered
     // separately and may change without changing the binary.
     if functions_digest(&worker.module?)? != KERNELS {
         return None;
     }
     let [samples, compilation, total]: [String; 3] = worker.outputs.try_into().ok()?;
-    let [warmup, _, _, rounds]: [String; 4] = worker.plan.try_into().ok()?;
+    let [warmup, _, _, rounds]: [String; 4] = worker.plan_fields.try_into().ok()?;
     let number = |name: &str| {
         strings.iter().find_map(|text| {
             text.strip_prefix(&format!("{name}:"))?
@@ -279,48 +291,88 @@ fn leb128(bytes: &[u8]) -> Option<(usize, &[u8])> {
     None
 }
 
-#[derive(Default)]
-struct Worker {
+/// The worker's WebAssembly module, the fields of its `plan` object in order of use, and the
+/// keys of the record it posts.
+struct Worker<'a> {
+    script: Script<'a>,
+    /// The `plan` object the worker source declares.
+    plan: Binding<'a>,
     module: Option<Vec<u8>>,
     outputs: Vec<String>,
-    plan: Vec<String>,
+    plan_fields: Vec<String>,
 }
 
-impl Visit for Worker {
-    fn visit_var_declarator(&mut self, declaration: &VarDeclarator) {
-        if let Some(value) = declaration.init.as_deref().and_then(ast::static_str)
-            && let Ok(bytes) = STANDARD.decode(value)
+impl<'a> Worker<'a> {
+    fn new(script: Script<'a>) -> Self {
+        let plan = match script.scoping.get_root_binding(Ident::from("plan")) {
+            Some(symbol) => Binding::Symbol(symbol),
+            None => Binding::Global("plan"),
+        };
+        Self {
+            script,
+            plan,
+            module: None,
+            outputs: Vec::new(),
+            plan_fields: Vec::new(),
+        }
+    }
+
+    /// Takes `text` as the module if it is a module's base64.
+    fn module_text(&mut self, text: &str) {
+        if let Ok(bytes) = STANDARD.decode(text)
             && bytes.starts_with(b"\0asm")
         {
             self.module = Some(bytes);
         }
-        declaration.visit_children_with(self);
     }
-    fn visit_member_expr(&mut self, member: &MemberExpr) {
-        if member.obj.as_ident().is_some_and(|name| name.sym == "plan")
-            && let MemberProp::Ident(name) = &member.prop
-            && !self.plan.contains(&name.sym.to_string())
-        {
-            self.plan.push(name.sym.to_string());
+}
+
+impl<'a> Visit<'a> for Worker<'a> {
+    fn visit_variable_declarator(&mut self, declaration: &VariableDeclarator<'a>) {
+        if let Some(value) = declaration.init.as_ref().and_then(ast::static_str) {
+            self.module_text(value);
         }
-        member.visit_children_with(self);
+        walk::walk_variable_declarator(self, declaration);
     }
-    fn visit_call_expr(&mut self, call: &CallExpr) {
-        if let Callee::Expr(callee) = &call.callee
-            && let Some(member) = callee.as_member()
-            && let MemberProp::Ident(name) = &member.prop
-            && name.sym == "postMessage"
-            && let Some(argument) = call.args.first()
-            && let Some(object) = argument.expr.as_object()
+    /// Deobfuscation inlines a module used once, as in `instantiate(decode("AGFzbQ..."))`.
+    fn visit_string_literal(&mut self, literal: &StringLiteral<'a>) {
+        if let Some(text) = literal.value.as_str() {
+            self.module_text(text);
+        }
+    }
+    fn visit_member_expression(&mut self, member: &MemberExpression<'a>) {
+        if let MemberExpression::StaticMemberExpression(field) = member
+            && let Expression::Identifier(object) = &field.object
+            && self.script.binding(object) == self.plan
+            && !self
+                .plan_fields
+                .iter()
+                .any(|name| name == field.property.name.as_str())
         {
-            let objects = ast::key_values(object).filter_map(|property| property.value.as_object());
-            for data in objects {
+            self.plan_fields.push(field.property.name.to_string());
+        }
+        walk::walk_member_expression(self, member);
+    }
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if !is_optional_call(call)
+            && let Some(MemberExpression::StaticMemberExpression(callee)) = member(&call.callee)
+            && callee.property.name == "postMessage"
+            && let Some(argument) = call.arguments.first()
+            && let Expression::ObjectExpression(object) = ast::argument_expression(argument)
+        {
+            let data = ast::key_values(object).filter_map(|property| match &property.value {
+                Expression::ObjectExpression(data) => Some(data),
+                _ => None,
+            });
+            if let Some(data) = data.last() {
                 self.outputs = ast::key_values(data)
-                    .filter_map(|property| ast::key_str(&property.key).map(str::to_owned))
+                    .filter_map(|property| {
+                        ast::key_str(&property.key, property.computed).map(str::to_owned)
+                    })
                     .collect();
             }
         }
-        call.visit_children_with(self);
+        walk::walk_call_expression(self, call);
     }
 }
 

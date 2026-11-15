@@ -1,12 +1,12 @@
 //! Disassembly values, effects, and exits for each feasible handler path. Byte-dependent values
 //! are concrete; register-dependent values remain expressions.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::iter;
 
-use swc_core::ecma::ast::{BinaryOp, UnaryOp};
+use oxc::syntax::operator::{BinaryOperator, LogicalOperator, UnaryOperator};
 
 /// A constant determined by program bytes.
 #[derive(Clone, Debug, PartialEq)]
@@ -43,8 +43,11 @@ pub enum Term {
         callee: Box<Term>,
         arguments: Vec<Term>,
     },
-    Unary(UnaryOp, Box<Term>),
-    Binary(BinaryOp, Box<Term>, Box<Term>),
+    Unary(UnaryOperator, Box<Term>),
+    Binary(BinaryOperator, Box<Term>, Box<Term>),
+    /// `&&`, `||` or `??` whose left side is register-dependent and whose right side has no
+    /// effects.
+    Logical(LogicalOperator, Box<Term>, Box<Term>),
     /// A program function with entry `pc`, dispatch `key`, saved registers, and declared
     /// argument count.
     Closure {
@@ -230,6 +233,9 @@ pub struct Listing {
     pub functions: Vec<Position>,
     pub failures: Vec<Failure>,
     pub hidden: Vec<Hidden>,
+    /// String constants the program passes to its own decoders, whose calls the listing shows
+    /// as loads of the decoded text.
+    pub encoded: BTreeSet<String>,
 }
 
 impl Term {
@@ -247,7 +253,9 @@ impl Term {
                     value.visit(visit);
                 }
             }
-            Term::Get(left, right) | Term::Binary(_, left, right) => {
+            Term::Get(left, right)
+            | Term::Binary(_, left, right)
+            | Term::Logical(_, left, right) => {
                 left.visit(visit);
                 right.visit(visit);
             }
@@ -375,12 +383,15 @@ impl Display for Term {
             } => write!(f, "{callee}({})", join(arguments, ", ")),
             Self::New { callee, arguments } => write!(f, "new {callee}({})", join(arguments, ", ")),
             Self::Unary(operator, argument) => match operator {
-                UnaryOp::TypeOf | UnaryOp::Void | UnaryOp::Delete => {
+                UnaryOperator::Typeof | UnaryOperator::Void | UnaryOperator::Delete => {
                     write!(f, "{} {argument}", operator.as_str())
                 }
                 _ => write!(f, "{}{argument}", operator.as_str()),
             },
             Self::Binary(operator, left, right) => {
+                write!(f, "({left} {} {right})", operator.as_str())
+            }
+            Self::Logical(operator, left, right) => {
                 write!(f, "({left} {} {right})", operator.as_str())
             }
             Self::Closure {

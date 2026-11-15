@@ -9,91 +9,104 @@
 //! Preserves branches containing declarations because `var` and function declarations may be
 //! hoisted into the enclosing scope.
 
-use swc_core::ecma::ast::{
-    ArrowExpr, Decl, EmptyStmt, Expr, Function, Lit, Program, Stmt, VarDecl, VarDeclKind,
+use oxc::allocator::{CloneIn, GetAllocator, Vec};
+use oxc::ast::ast::{
+    ArrowFunctionExpression, Expression, Function, FunctionType, Program, Statement,
+    VariableDeclaration, VariableDeclarationKind,
 };
-use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith};
+use oxc::ast_visit::{Visit, VisitMut, walk, walk_mut};
+use oxc::syntax::scope::ScopeFlags;
 
 use super::analysis::Analysis;
-use super::removal;
+use super::ast;
 
-pub(super) fn run(program: &mut Program, _: &mut Analysis) -> bool {
-    let mut remove = RemoveDeadBranches { changed: false };
-    program.visit_mut_with(&mut remove);
-    remove.changed
+pub(super) fn run<'a>(program: &mut Program<'a>, analysis: &mut Analysis<'a>) -> bool {
+    let mut dead = Dead {
+        analysis,
+        changed: false,
+    };
+    dead.visit_program(program);
+    dead.changed
 }
 
-struct RemoveDeadBranches {
+struct Dead<'b, 'a> {
+    analysis: &'b Analysis<'a>,
     changed: bool,
 }
 
-impl VisitMut for RemoveDeadBranches {
-    fn visit_mut_stmts(&mut self, statements: &mut Vec<Stmt>) {
-        statements.visit_mut_children_with(self);
-        self.changed |= removal::retain(statements, |statement| !is_inert(statement));
-    }
-
-    fn visit_mut_stmt(&mut self, statement: &mut Stmt) {
-        statement.visit_mut_children_with(self);
-        if let Stmt::If(conditional) = statement
-            && let Expr::Lit(Lit::Bool(test)) = &*conditional.test
+impl<'a> VisitMut<'a> for Dead<'_, 'a> {
+    fn visit_statement(&mut self, statement: &mut Statement<'a>) {
+        walk_mut::walk_statement(self, statement);
+        if let Statement::IfStatement(branch) = statement
+            && let Some(test) = ast::truthiness(&branch.test)
         {
-            let (taken, dropped) = if test.value {
-                (Some(&*conditional.cons), conditional.alt.as_deref())
+            let (taken, dropped) = if test {
+                (Some(&branch.consequent), branch.alternate.as_ref())
             } else {
-                (conditional.alt.as_deref(), Some(&*conditional.cons))
+                (branch.alternate.as_ref(), Some(&branch.consequent))
             };
             if dropped.is_none_or(|dropped| !declares(dropped)) {
-                *statement = taken.cloned().unwrap_or(Stmt::Empty(EmptyStmt {
-                    span: conditional.span,
-                }));
+                *statement = match taken {
+                    Some(taken) => taken.clone_in_with_semantic_ids(self.analysis.allocator()),
+                    None => Statement::new_empty_statement(branch.span, &self.analysis.ast),
+                };
                 self.changed = true;
             }
         }
     }
-}
 
-/// Checks whether a statement is empty or has no effects. Keeps string statements because they
-/// may be directives.
-fn is_inert(statement: &Stmt) -> bool {
-    match statement {
-        Stmt::Empty(_) => true,
-        Stmt::Expr(statement) => match &*statement.expr {
-            Expr::Lit(Lit::Bool(_) | Lit::Num(_) | Lit::Null(_)) => true,
-            Expr::Ident(id) => id.sym == "undefined",
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-fn declares(statement: &Stmt) -> bool {
-    use swc_core::ecma::visit::VisitWith;
-
-    let mut declarations = Declarations(false);
-    statement.visit_with(&mut declarations);
-    declarations.0
-}
-
-/// Checks whether a statement contains declarations hoisted into its enclosing scope.
-struct Declarations(bool);
-
-impl Visit for Declarations {
-    fn visit_decl(&mut self, declaration: &Decl) {
-        match declaration {
-            Decl::Fn(_) => self.0 = true,
-            Decl::Var(variables) => self.visit_var_decl(variables),
-            _ => {}
+    fn visit_statements(&mut self, statements: &mut Vec<'a, Statement<'a>>) {
+        walk_mut::walk_statements(self, statements);
+        let before = statements.len();
+        // Statements after one that always completes abruptly never run. Declarations stay:
+        // `var` and functions hoist, and `let`, `const`, and classes shadow outer bindings.
+        if let Some(end) = statements
+            .iter()
+            .position(|statement| ast::abrupt(statement, true))
+        {
+            let mut index = 0;
+            statements.retain(|statement| {
+                index += 1;
+                index <= end + 1 || statement.is_declaration() || declares(statement)
+            });
         }
+        statements.retain(|statement| match statement {
+            Statement::EmptyStatement(_) => false,
+            Statement::ExpressionStatement(statement) => match &statement.expression {
+                Expression::BooleanLiteral(_)
+                | Expression::NumericLiteral(_)
+                | Expression::NullLiteral(_) => false,
+                Expression::Identifier(identifier) => {
+                    !self.analysis.is_global(identifier, "undefined")
+                }
+                _ => true,
+            },
+            _ => true,
+        });
+        self.changed |= statements.len() != before;
+    }
+}
+
+/// Checks for `var` or function declarations that would hoist out of the statement.
+fn declares(statement: &Statement<'_>) -> bool {
+    struct Declares(bool);
+
+    impl<'a> Visit<'a> for Declares {
+        fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+            self.0 |= declaration.kind == VariableDeclarationKind::Var;
+            walk::walk_variable_declaration(self, declaration)
+        }
+
+        fn visit_function(&mut self, function: &Function<'a>, _: ScopeFlags) {
+            self.0 |= function.r#type == FunctionType::FunctionDeclaration
+        }
+
+        fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
     }
 
-    fn visit_var_decl(&mut self, declaration: &VarDecl) {
-        self.0 |= declaration.kind == VarDeclKind::Var;
-    }
-
-    // Nested function declarations stay within their own function scope.
-    fn visit_function(&mut self, _: &Function) {}
-    fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
+    let mut declares = Declares(false);
+    declares.visit_statement(statement);
+    declares.0
 }
 
 #[cfg(test)]
@@ -102,15 +115,36 @@ mod tests {
 
     #[test]
     fn removes_dead_code_but_not_hoisted_declarations() {
-        let transform = |source: &str| testing::rewrite(source, super::run, /* fix= */ false);
+        let transform = |source: &str| testing::rewrite(source, super::run);
         let output = transform(
             "function f() { if (false) { undefined; } true; 0; if (true) a(); else b(); if (false) c(); else { d(); } return g(); }",
         );
         testing::assert_lacks(&output, &["undefined", "true", "b()", "c()"]);
-        testing::assert_contains(&output, &["a();", "d();"], &[]);
+        testing::assert_contains(&output, &["a();", "d();"]);
         let output = transform(
             "function f() { if (false) { var x; } if (false) { function g() {} } return x; }",
         );
-        testing::assert_contains(&output, &["var x", "function g"], &[]);
+        testing::assert_contains(&output, &["var x", "function g"]);
+    }
+
+    #[test]
+    fn removes_statements_after_abrupt_completions() {
+        let transform = |source: &str| testing::rewrite(source, super::run);
+        // A split merged function keeps its case's trailing `return;`.
+        let output = transform(
+            "function f(r, i) { if (r.J[i] === -4) { return r.H[i]; } else { return g(r, i); } return; }",
+        );
+        testing::assert_contains(&output, &["return r.H[i]", "return g(r, i)"]);
+        testing::assert_lacks(&output, &["return;"]);
+        let output = transform(
+            "function f() { { throw e; } a(); var x = b(); function g() {} let y; return x + y; }",
+        );
+        testing::assert_lacks(&output, &["a()", "return x"]);
+        testing::assert_contains(&output, &["var x = b()", "function g", "let y"]);
+        // Code after a one-armed `if` or a labeled block that breaks itself still runs.
+        let output = transform("function f() { if (c) return; a(); l: { break l; } b(); }");
+        testing::assert_contains(&output, &["a()", "b()"]);
+        let output = transform("function f() { while (c) { if (d) break; else continue; a(); } }");
+        testing::assert_lacks(&output, &["a()"]);
     }
 }
