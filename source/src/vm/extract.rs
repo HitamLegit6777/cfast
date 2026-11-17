@@ -15,7 +15,7 @@ use oxc::ast::ast::{
 use oxc::ast_visit::{Visit, walk};
 use oxc::semantic::{ScopeFlags, SymbolId};
 use oxc::span::GetSpan;
-use oxc::syntax::operator::AssignmentOperator;
+use oxc::syntax::operator::{AssignmentOperator, BinaryOperator};
 
 use super::output::Position;
 use super::{HashMap, convert};
@@ -36,7 +36,8 @@ pub(super) struct Found<'a> {
 /// Finds the VM from its one program runner: the class the runner constructs, the run function
 /// it calls, and the function body declaring both.
 pub(super) fn find<'a>(script: Script<'a>) -> Result<Found<'a>> {
-    let runner = candidates::exactly_one(runners(script), "program runner")?;
+    let runner = candidates::exactly_one(runners(script), "program runner")
+        .or_else(|_| candidates::exactly_one(helper_runners(script), "program runner"))?;
     // The declaration of `reference` and its parent.
     let declaration = |reference: &IdentifierReference<'_>| {
         let symbol = script
@@ -569,17 +570,7 @@ struct Runner<'ast> {
 
 impl<'ast> Runner<'ast> {
     fn installed_by(assignment: &'ast AssignmentExpression<'ast>) -> Option<Self> {
-        let target = assignment.left.as_member_expression()?;
-        if matches!(target.object(), Expression::Super(_)) {
-            return None;
-        }
-        let Expression::FunctionExpression(function) = &assignment.right else {
-            return None;
-        };
-        let body = function.body.as_deref()?;
-        if !body.directives.is_empty() {
-            return None;
-        }
+        let (name, body) = installed_body(assignment)?;
         let [Statement::ReturnStatement(returned)] = after_bare_declarations(&body.statements)
         else {
             return None;
@@ -587,29 +578,92 @@ impl<'ast> Runner<'ast> {
         let (run, [machine, pc, key, _]) = ast::direct_call(returned.argument.as_ref()?)? else {
             return None;
         };
-        let (
-            Expression::NewExpression(machine),
-            Expression::NumericLiteral(pc),
-            Expression::NumericLiteral(key),
-        ) = (
+        let (class, pc, key) = runner_arguments(
             ast::argument_expression(machine),
             ast::argument_expression(pc),
             ast::argument_expression(key),
-        )
+        )?;
+        Some(Self {
+            name,
+            run,
+            class,
+            pc,
+            key,
+        })
+    }
+
+    /// A runner whose run call the helper writes, as some builds spell it in the decoding-only
+    /// tree: `return key = 0, <helper>(<opcode>, <run>, new <Class>(p), <a>, <b>, []);`.
+    fn installed_by_helper(
+        script: Script<'ast>,
+        assignment: &'ast AssignmentExpression<'ast>,
+    ) -> Option<Self> {
+        let (name, body) = installed_body(assignment)?;
+        let [Statement::ReturnStatement(returned)] = after_bare_declarations(&body.statements)
         else {
             return None;
         };
-        let Expression::Identifier(class) = &machine.callee else {
+        let (constants, expression) = sequence_constants(returned.argument.as_ref()?);
+        let Expression::CallExpression(call) = expression else {
             return None;
         };
+        let Expression::Identifier(helper) = &call.callee else {
+            return None;
+        };
+        let [run, machine, pc, key] = helper_arguments(script, helper)?;
+        let argument = |position: usize| ast::argument_expression(&call.arguments[position]);
+        let Expression::NewExpression(new) = argument(machine) else {
+            return None;
+        };
+        let Expression::Identifier(class) = &new.callee else {
+            return None;
+        };
+        let Expression::Identifier(run) = argument(run) else {
+            return None;
+        };
+        let pc = constant(script, &constants, argument(pc))?;
+        let key = constant(script, &constants, argument(key))?;
         Some(Self {
-            name: ast::member_str(target)?,
+            name,
             run,
             class,
-            pc: pc.value,
-            key: key.value,
+            pc,
+            key,
         })
     }
+}
+
+/// The global name the runner is installed under and the function body that installs it.
+fn installed_body<'ast>(
+    assignment: &'ast AssignmentExpression<'ast>,
+) -> Option<(&'ast str, &'ast FunctionBody<'ast>)> {
+    let target = assignment.left.as_member_expression()?;
+    if matches!(target.object(), Expression::Super(_)) {
+        return None;
+    }
+    let Expression::FunctionExpression(function) = &assignment.right else {
+        return None;
+    };
+    let body = function.body.as_deref()?;
+    if !body.directives.is_empty() {
+        return None;
+    }
+    Some((ast::member_str(target)?, body))
+}
+
+/// The VM class and the entry `(pc, key)` a run call passes.
+fn runner_arguments<'a>(
+    machine: &'a Expression<'a>,
+    pc: &Expression<'a>,
+    key: &Expression<'a>,
+) -> Option<(&'a IdentifierReference<'a>, f64, f64)> {
+    let Expression::NewExpression(machine) = machine else {
+        return None;
+    };
+    let Expression::Identifier(class) = &machine.callee else {
+        return None;
+    };
+    Some((class, ast::number(pc)?, ast::number(key)?))
 }
 
 /// Every program runner the script installs.
@@ -620,9 +674,188 @@ fn runners<'a>(script: Script<'a>) -> impl Iterator<Item = Runner<'a>> {
     })
 }
 
+/// Every program runner the script installs through a call helper, as some builds write it in
+/// the decoding-only tree that stack extraction parses.
+fn helper_runners<'a>(script: Script<'a>) -> impl Iterator<Item = Runner<'a>> {
+    script.nodes.iter().filter_map(move |node| match node.kind() {
+        AstKind::AssignmentExpression(assignment) => {
+            Runner::installed_by_helper(script, assignment)
+        }
+        _ => None,
+    })
+}
+
+/// Resolves `<helper>(<opcode>, <run>, new <Class>(p), <a>, <b>, [])` onto the arguments the
+/// helper's own `return <run>(<machine>, <pc>, <key>, <cells>)` passes to the run function, as
+/// indexes into the call's arguments: `[run, machine, pc, key]`.
+fn helper_arguments<'a>(
+    script: Script<'a>,
+    helper: &IdentifierReference<'a>,
+) -> Option<[usize; 4]> {
+    let symbol = script.symbol(helper)?;
+    let node = script.scoping.symbol_declaration(symbol);
+    let AstKind::Function(function) = script.nodes.kind(node) else {
+        return None;
+    };
+    let body = function.body.as_deref()?;
+    let parameters: Vec<&str> = function
+        .params
+        .items
+        .iter()
+        .filter_map(|parameter| match &parameter.pattern {
+            BindingPattern::BindingIdentifier(name) => Some(name.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    // `var r = [p0, p2, p3, p1]` reorders the parameters the return call passes.
+    let mut arrays: HashMap<&str, Vec<usize>> = HashMap::default();
+    for statement in &body.statements {
+        let Statement::VariableDeclaration(declaration) = statement else {
+            continue;
+        };
+        for declarator in &declaration.declarations {
+            let (BindingPattern::BindingIdentifier(name), Some(Expression::ArrayExpression(array))) =
+                (&declarator.id, &declarator.init)
+            else {
+                continue;
+            };
+            let mut indexes = Vec::with_capacity(array.elements.len());
+            for element in &array.elements {
+                let Expression::Identifier(reference) = element.as_expression()? else {
+                    return None;
+                };
+                indexes.push(parameters.iter().position(|name| *name == reference.name.as_str())?);
+            }
+            arrays.insert(name.name.as_str(), indexes);
+        }
+    }
+    let span = function.span;
+    for node in script.nodes.iter() {
+        if !span.contains_inclusive(node.span()) {
+            continue;
+        }
+        let AstKind::ReturnStatement(returned) = node.kind() else {
+            continue;
+        };
+        let Expression::CallExpression(call) = returned.argument.as_ref()? else {
+            continue;
+        };
+        let Expression::Identifier(run) = &call.callee else {
+            continue;
+        };
+        let [machine, pc, key, _] = &call.arguments[..] else {
+            continue;
+        };
+        let position = |expression: &Expression<'a>| match expression {
+            Expression::Identifier(reference) => {
+                parameters.iter().position(|name| *name == reference.name.as_str())
+            }
+            expression => {
+                let MemberExpression::ComputedMemberExpression(member) =
+                    expression.as_member_expression()?
+                else {
+                    return None;
+                };
+                let Expression::Identifier(object) = &member.object else {
+                    return None;
+                };
+                arrays
+                    .get(object.name.as_str())?
+                    .get(ast::number(&member.expression)? as usize)
+                    .copied()
+            }
+        };
+        let positions = [
+            parameters.iter().position(|name| *name == run.name.as_str())?,
+            position(ast::argument_expression(machine))?,
+            position(ast::argument_expression(pc))?,
+            position(ast::argument_expression(key))?,
+        ];
+        return Some(positions);
+    }
+    None
+}
+
+/// The constants `expression` assigns to identifiers before its last expression, paired with
+/// that last expression, so `return key = 0, helper(…)` yields `key = 0`.
+fn sequence_constants<'a>(
+    expression: &'a Expression<'a>,
+) -> (HashMap<&'a str, f64>, &'a Expression<'a>) {
+    let Expression::SequenceExpression(sequence) = expression else {
+        return (HashMap::default(), expression);
+    };
+    let Some((last, leading)) = sequence.expressions.split_last() else {
+        return (HashMap::default(), expression);
+    };
+    let mut constants = HashMap::default();
+    for expression in leading {
+        let Expression::AssignmentExpression(assignment) = expression else {
+            continue;
+        };
+        let AssignmentTarget::AssignmentTargetIdentifier(target) = &assignment.left else {
+            continue;
+        };
+        if let Some(number) = ast::number(&assignment.right) {
+            constants.insert(target.name.as_str(), number);
+        }
+    }
+    (constants, last)
+}
+
+/// Evaluates the numbers a runner's program counter and dispatch key are written as: literals,
+/// identifiers bound to one, and the bitwise and arithmetic expressions folding them.
+fn constant<'a>(
+    script: Script<'a>,
+    constants: &HashMap<&'a str, f64>,
+    expression: &Expression<'a>,
+) -> Option<f64> {
+    if let Some(number) = ast::number(expression) {
+        return Some(number);
+    }
+    match expression {
+        Expression::ParenthesizedExpression(inner) => {
+            constant(script, constants, &inner.expression)
+        }
+        Expression::Identifier(reference) => constants
+            .get(reference.name.as_str())
+            .copied()
+            .or_else(|| declared_number(script, reference)),
+        Expression::BinaryExpression(binary) => {
+            let left = constant(script, constants, &binary.left)? as i32;
+            let right = constant(script, constants, &binary.right)? as i32;
+            Some(match binary.operator {
+                BinaryOperator::BitwiseXOR => (left ^ right) as f64,
+                BinaryOperator::BitwiseOR => (left | right) as f64,
+                BinaryOperator::BitwiseAnd => (left & right) as f64,
+                BinaryOperator::Addition => (left + right) as f64,
+                BinaryOperator::Subtraction => (left - right) as f64,
+                BinaryOperator::Multiplication => (left * right) as f64,
+                BinaryOperator::ShiftLeft => left.wrapping_shl(right as u32) as f64,
+                BinaryOperator::ShiftRight => (left >> right) as f64,
+                BinaryOperator::ShiftRightZeroFill => ((left as u32) >> right) as f64,
+                _ => return None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The number a `var`/`let`/`const` declaration binds `reference` to, when its initializer is
+/// one.
+fn declared_number<'a>(script: Script<'a>, reference: &IdentifierReference<'a>) -> Option<f64> {
+    let symbol = script.symbol(reference)?;
+    let node = script.scoping.symbol_declaration(symbol);
+    let AstKind::VariableDeclarator(declarator) = script.nodes.kind(node) else {
+        return None;
+    };
+    ast::number(declarator.init.as_ref()?)
+}
+
 /// Returns the installed program runner's name if exactly one exists (see [`Runner`]).
 pub(crate) fn runner_name(script: Script<'_>) -> Option<String> {
-    let runner = candidates::exactly_one(runners(script), "program runner").ok()?;
+    let runner = candidates::exactly_one(runners(script), "program runner")
+        .or_else(|_| candidates::exactly_one(helper_runners(script), "program runner"))
+        .ok()?;
     Some(runner.name.to_owned())
 }
 
@@ -689,6 +922,45 @@ mod tests {
             entry_of(source).is_err(),
             "the run function is declared beside the class"
         );
+    }
+
+    #[test]
+    fn finds_a_runner_written_through_a_call_helper() {
+        let source = r#"
+            function f(O) {
+                class M {}
+                function run(m, pc, key, cells) {}
+                function I(a, b, c, d, e, g) {
+                    switch (a ^ 2183) {
+                        case 554871: return b(c, d, e, g);
+                        case 467539: return b(c, d, e, g);
+                    }
+                }
+                O.vlJM8 = function (p) { return k = 0, I(477672, run, new M(p), k, k, []); };
+            }
+        "#;
+        assert_eq!(entry_of(source).unwrap(), Position::new(0, 0), "{source}");
+    }
+
+    #[test]
+    fn finds_a_runner_whose_helper_reorders_its_arguments() {
+        let source = r#"
+            function f(O) {
+                class M {}
+                function run(m, pc, key, cells) {}
+                function Y(base, fn, a, b, c, cells) {
+                    var r = [base, a, c, b];
+                    switch (2982 ^ r[0]) {
+                        case 484181: return fn(r[1], r[2], r[3], cells);
+                    }
+                }
+                var key = 920678467;
+                O.vlJM8 = function (p) {
+                    return Y(485619, run, new M(p), 0, 920678448 ^ key, []);
+                };
+            }
+        "#;
+        assert_eq!(entry_of(source).unwrap(), Position::new(115, 0), "{source}");
     }
 
     #[test]

@@ -123,6 +123,11 @@ This repo ships:
   profiles between directories.
 - If a challenge responds `probe N matches no known collector`, retry — the
   orchestrator script rotates per request and most retries succeed.
+- Since `v1.2.0-managed`, runner detection also reads the decoded challenge
+  tree, where the VM is installed as
+  `return key = 0, <helper>(<opcode>, <run>, new <Class>(p), …)` instead of
+  `return <run>(new <Class>(p), pc, key, [])`. Older builds failed those
+  challenges with `expected one program runner, found 0`.
 
 ## LICENSE
 

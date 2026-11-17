@@ -1015,7 +1015,17 @@ impl<'a> RunFunction<'a> {
             let Some(Statement::ReturnStatement(returned)) = body.only_statement() else {
                 continue;
             };
-            let Some(Expression::CallExpression(call)) = &returned.argument else {
+            let Some(mut value) = returned.argument.as_ref() else {
+                continue;
+            };
+            value = value.without_parentheses();
+            if let Expression::SequenceExpression(sequence) = value {
+                let Some(last) = sequence.expressions.last() else {
+                    continue;
+                };
+                value = last.without_parentheses();
+            }
+            let Expression::CallExpression(call) = value else {
                 continue;
             };
             let Ok(target) = Scope::new("", &body, &script.appliers).target(call) else {
@@ -2277,6 +2287,20 @@ mod tests {
             captured == alone,
             "the captured program differs from the decoded one"
         );
+    }
+
+    /// The decoded tree installs the VM runner through a helper call wrapped in a sequence
+    /// (`return key = 0, <helper>(<opcode>, <run>, new <Class>(p), …)`), so summarizing the
+    /// dispatch loops of a saved challenge script exercises that shape end to end.
+    #[test]
+    fn summarizes_the_dispatch_loops_of_a_saved_script() {
+        let Some(path) = std::env::var_os("CFSOLVE_CAPTURE_SCRIPT") else {
+            return;
+        };
+        let source = std::fs::read_to_string(path).expect("the capture script is readable");
+        let (_, cases) = deobfuscate_with_cases(source.clone()).unwrap();
+        let loops = dispatch_summary(&source, &cases).unwrap();
+        assert!(!loops.is_empty(), "the script runs no dispatch loop");
     }
 
     #[test]
